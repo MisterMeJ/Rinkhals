@@ -23,16 +23,35 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Set version
-      id: version
-      run: echo "VERSION=$(date +%Y%m%d)_$(printf '%02d' ${{ github.run_number }})" >> $GITHUB_OUTPUT
+    - name: Calculate daily build number
+      id: daily_build
+      run: |
+        TODAY=$(date +%Y%m%d)
+        
+        # Get all tags that match today's date
+        TAGS=$(git ls-remote --tags origin | grep -o "refs/tags/${TODAY}_[0-9]*$" | sed "s/refs\/tags\/${TODAY}_//" || echo "0")
+        
+        # Find the highest build number for today
+        MAX_BUILD=0
+        for tag in $TAGS; do
+          if [ "$tag" -gt "$MAX_BUILD" ]; then
+            MAX_BUILD=$tag
+          fi
+        done
+        
+        # Increment for next build
+        NEXT_BUILD=$((MAX_BUILD + 1))
+        BUILD_NUM=$(printf '%02d' $NEXT_BUILD)
+        
+        echo "VERSION=${TODAY}_${BUILD_NUM}" >> $GITHUB_OUTPUT
+        echo "Building version: ${TODAY}_${BUILD_NUM}"
     - name: Build Docker image for KS1
       uses: docker/build-push-action@v6
       with:
         push: false
         context: .
         build-args: |
-          version=${{ steps.version.outputs.VERSION }}
+          version=${{ steps.daily_build.outputs.VERSION }}
           KOBRA_MODEL_CODE=ks1
         outputs: type=local,dest=./build/dist
         cache-from: ${{ inputs.use_cache && 'type=gha' || '' }}
@@ -45,6 +64,6 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: artifact/update.swu
-        tag_name: ${{ steps.version.outputs.VERSION }}
+        tag_name: ${{ steps.daily_build.outputs.VERSION }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
