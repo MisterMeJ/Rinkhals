@@ -27,24 +27,20 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     - name: Calculate daily build number
       id: daily_build
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         TODAY=$(date +%Y%m%d)
         
-        # Get all tags that match today's date
-        MAX_BUILD=0
-        while IFS= read -r tag; do
-          if [[ $tag =~ ^${TODAY}_([0-9]+)$ ]]; then
-            BUILD_NUM="${BASH_REMATCH[1]}"
-            # Remove leading zeros for comparison
-            BUILD_NUM=$((10#$BUILD_NUM))
-            if [ "$BUILD_NUM" -gt "$MAX_BUILD" ]; then
-              MAX_BUILD=$BUILD_NUM
-            fi
-          fi
-        done < <(git tag -l "${TODAY}_*")
+        echo "Today's date: $TODAY"
         
-        # Increment for next build
-        NEXT_BUILD=$((MAX_BUILD + 1))
+        # Count releases created today with YYYYMMDD_NN format
+        COUNT=$(gh release list --limit 1000 | grep "^${TODAY}_" | wc -l)
+        
+        echo "Found $COUNT releases for today"
+        
+        # Next build number
+        NEXT_BUILD=$((COUNT + 1))
         BUILD_NUM=$(printf '%02d' $NEXT_BUILD)
         
         echo "VERSION=${TODAY}_${BUILD_NUM}" >> $GITHUB_OUTPUT
