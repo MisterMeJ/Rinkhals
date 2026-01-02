@@ -542,7 +542,7 @@ class MmuAceController:
         self.eventloop = self.server.get_event_loop()
         # --- Spoolman integration state (PATCH 2) ---
         # off | readonly | push | pull
-        self.spoolman_support = "off"
+        self.spoolman_support: str = "off"
 
         # Prevent parallel spoolman tasks
         self._spoolman_task = None
@@ -570,9 +570,14 @@ class MmuAceController:
         else:
             self.printer = RemotePrinterController(self.server, host)
 
-        # Start periodic cache cleanup task (runs every 60 seconds)
-        # Removes expired temperature cache entries to prevent slow memory leak
-        asyncio.create_task(self._periodic_cache_cleanup())
+        # --- Spoolman component lookup (PATCH 3) ---
+        try:
+           self.spoolman = self.server.lookup_component("spoolman")
+           logging.info("[Spoolman] Component found and connected")
+        except Exception:
+            self.spoolman = None
+            logging.info("[Spoolman] Component not available")
+        # ------------------------------------------
     
     async def _run_spoolman_task(self, coro):
         """
@@ -590,6 +595,40 @@ class MmuAceController:
 
         self._spoolman_task = self.eventloop.create_task(runner())
 
+
+    async def _spoolman_set_active_spool(self, spool_id: int | None):
+        """
+        Notify Spoolman about active spool change.
+        spool_id = None -> clear active spool
+        """
+        # Only active in push mode
+        if self.spoolman_support != "push":
+            return
+
+        # Rate limit: max 1 update per second
+        now = time.time()
+        if now - self._last_spoolman_sync < 1.0:
+            return
+        self._last_spoolman_sync = now
+
+        async def task():
+            try:
+                if spool_id is None:
+                    await self.server.call_method(
+                        "spoolman_set_active_spool",
+                        {}
+                    )
+                    logging.info("[Spoolman] cleared active spool")
+                else:
+                    await self.server.call_method(
+                        "spoolman_set_active_spool",
+                        {"spool_id": spool_id}
+                    )
+                    logging.info(f"[Spoolman] active spool set to {spool_id}")
+            except Exception as e:
+                logging.warning(f"[Spoolman] push failed: {e}")
+
+        await self._run_spoolman_task(task())
 
     def _handle_status_update(self, force: bool = False, throttle: bool = False):
         """Send status update notification with debouncing or throttling.
@@ -993,27 +1032,43 @@ class MmuAceController:
 
                 # Parse SKU for additional information
                 gate.sku = sku
+                gate.vendor = ""
+                gate.series = ""
+                gate.color_name = ""
+
                 if sku:
                     sku_info = parse_anycubic_sku(sku)
-                    gate.vendor = sku_info["vendor"]
-                    gate.series = sku_info["series"]
-                    gate.color_name = sku_info["color_name"]
-                    # Use serial number as spool_id if available
+
+                    gate.vendor = sku_info.get("vendor", "")
+                    gate.series = sku_info.get("series", "")
+                    gate.color_name = sku_info.get("color_name", "")
+
+                    # Spoolman spool_id:
+                    # - use serial from SKU if available
+                    # - otherwise: NOT mapped (-1)
                     try:
-                        gate.spool_id = int(sku_info["serial"]) if sku_info["serial"] else abs(hash(sku)) % (2**31)
-                    except:
-                        gate.spool_id = abs(hash(sku)) % (2**31)
+                        gate.spool_id = int(sku_info["serial"]) if sku_info.get("serial") else -1
+                    except Exception:
+                        gate.spool_id = -1
 
                     # Update filament_name with full description if parsed
-                    if sku_info["vendor"] and sku_info["series"]:
-                        parts = [sku_info["vendor"], sku_info["series"], sku_info["material_type"]]
-                        if sku_info["color_name"]:
-                            parts.append(sku_info["color_name"])
+                    if gate.vendor or gate.series:
+                        parts = []
+                        if gate.vendor:
+                            parts.append(gate.vendor)
+                        if gate.series:
+                            parts.append(gate.series)
+                        if gate.material:
+                            parts.append(gate.material)
+                        if gate.color_name:
+                            parts.append(gate.color_name)
                         gate.filament_name = " ".join(parts)
                 else:
-                    gate.spool_id = 0
+                    # No SKU → no Spoolman mapping
+                    gate.spool_id = -1
 
                 unit.gates.append(gate)
+
 
                 # Create tool with global index (spans across all units)
                 # Tool 0 = Unit 0 Gate 0, Tool 4 = Unit 1 Gate 0, etc.
@@ -1344,6 +1399,21 @@ class MmuAcePatcher:
 
         self.reinit()
 
+        # --- Spoolman config ---
+        spoolman_cfg = config.getsection("spoolman", None)
+        if spoolman_cfg:
+            mode = spoolman_cfg.get("mode", "off").lower()
+            if mode in ("readonly", "push"):
+                self.ace_controller.spoolman_support = mode
+                logging.info(f"[Spoolman] enabled (mode={mode})")
+            else:
+                self.ace_controller.spoolman_support = "off"
+                logging.info("[Spoolman] disabled (mode=off)")
+        else:
+            self.ace_controller.spoolman_support = "off"
+        # -----------------------
+
+
         # mmu test enpoints
         self.server.register_endpoint("/server/mmu-ace", ['GET'], self._handle_mmu_request)
 
@@ -1425,50 +1495,85 @@ class MmuAcePatcher:
     async def _on_gcode_mmu_unknown(self, args: dict[str, str | None], delegate):
         pass
 
-    async def _on_gcode_mmu_select(self, args: dict[str, str | None], delegate):
-        """Select gate or tool (Happy Hare compatible)"""
-        tool = self._get_gcode_arg_int("TOOL", args, default=-1)
-        gate = self._get_gcode_arg_int("GATE", args, default=-1)
-        bypass = self._get_gcode_arg_int("BYPASS", args, default=0)
+async def _on_gcode_mmu_select(self, args: dict[str, str | None], delegate):
+    """Select gate or tool (Happy Hare compatible)"""
+    tool = self._get_gcode_arg_int("TOOL", args, default=-1)
+    gate = self._get_gcode_arg_int("GATE", args, default=-1)
+    bypass = self._get_gcode_arg_int("BYPASS", args, default=0)
 
-        if bypass == 1:
-            # ACE has no bypass - log warning
-            logging.warning("MMU_SELECT BYPASS=1 not supported on ACE hardware")
-            return
+    if bypass == 1:
+        # ACE has no bypass - log warning
+        logging.warning("MMU_SELECT BYPASS=1 not supported on ACE hardware")
+        return
 
-        if gate >= 0:
-            # Direct gate selection
-            num_gates = sum(len(unit.gates) for unit in self.ace.units)
-            if gate < num_gates:
-                self.ace.gate = gate
+    # ------------------------------------------------------------
+    # Direct GATE selection
+    # ------------------------------------------------------------
+    if gate >= 0:
+        num_gates = sum(len(unit.gates) for unit in self.ace.units)
+        if gate < num_gates:
+            self.ace.gate = gate
 
-                # Find tool that maps to this gate (reverse TTG lookup)
-                self.ace.tool = -1
-                for tool_idx, gate_idx in enumerate(self.ace.ttg_map):
-                    if gate_idx == gate:
-                        self.ace.tool = tool_idx
-                        break
+            # Find tool that maps to this gate (reverse TTG lookup)
+            self.ace.tool = -1
+            for tool_idx, gate_idx in enumerate(self.ace.ttg_map):
+                if gate_idx == gate:
+                    self.ace.tool = tool_idx
+                    break
 
-                # Set filament_pos to UNLOADED (selection is not loading, just preparation)
-                self.ace.filament.pos = FILAMENT_POS_UNLOADED
+            # Selection only → not loaded
+            self.ace.filament.pos = FILAMENT_POS_UNLOADED
 
-                self.ace_controller._handle_status_update(throttle=True)  # Throttle: max 3 updates/sec
-                logging.info(f"Selected gate {gate}, tool {self.ace.tool}, filament_pos set to UNLOADED")
-            else:
-                logging.error(f"Invalid gate {gate}, total gates: {num_gates}")
-        elif tool >= 0:
-            # Resolve tool to gate via TTG map
-            if tool < len(self.ace.ttg_map):
-                self.ace.gate = self.ace.ttg_map[tool]
-                self.ace.tool = tool
+            self.ace_controller._handle_status_update(throttle=True)
+            logging.info(
+                f"Selected gate {gate}, tool {self.ace.tool}, filament_pos set to UNLOADED"
+            )
 
-                # Set filament_pos to UNLOADED (selection is not loading, just preparation)
-                self.ace.filament.pos = FILAMENT_POS_UNLOADED
+            # --- Spoolman PUSH sync (gate select) ---
+            if self.ace_controller.spoolman_support == "push":
+                gate_lookup = self.ace_controller._get_gate_by_index(gate)
+                if gate_lookup:
+                    _, gate_obj = gate_lookup
+                    spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
 
-                self.ace_controller._handle_status_update(throttle=True)  # Throttle: max 3 updates/sec
-                logging.info(f"Selected tool {tool} -> gate {self.ace.gate}, filament_pos set to UNLOADED")
-            else:
-                logging.error(f"Invalid tool {tool}, total tools: {len(self.ace.ttg_map)}")
+                    self.ace_controller._run_spoolman_task(
+                        await self.ace_controller._spoolman_set_active_spool(spool_id)
+                    )
+            # ---------------------------------------
+
+        else:
+            logging.error(f"Invalid gate {gate}, total gates: {num_gates}")
+
+    # ------------------------------------------------------------
+    # TOOL selection (resolve to gate)
+    # ------------------------------------------------------------
+    elif tool >= 0:
+        if tool < len(self.ace.ttg_map):
+            gate = self.ace.ttg_map[tool]
+            self.ace.gate = gate
+            self.ace.tool = tool
+
+            self.ace.filament.pos = FILAMENT_POS_UNLOADED
+
+            self.ace_controller._handle_status_update(throttle=True)
+            logging.info(
+                f"Selected tool {tool} -> gate {gate}, filament_pos set to UNLOADED"
+            )
+
+            # --- Spoolman PUSH sync (tool select) ---
+            if self.ace_controller.spoolman_support == "push":
+                gate_lookup = self.ace_controller._get_gate_by_index(gate)
+                if gate_lookup:
+                    _, gate_obj = gate_lookup
+                    spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
+
+                    self.ace_controller._run_spoolman_task(
+                        await self.ace_controller._spoolman_set_active_spool(spool_id)
+                    )
+            # ---------------------------------------
+
+        else:
+            logging.error(f"Invalid tool {tool}, total tools: {len(self.ace.ttg_map)}")
 
     async def _on_gcode_mmu_slicer_tool_map(self, args: dict[str, str | None], delegate):
         """Set slicer tool mapping (Happy Hare compatible)"""
@@ -1670,6 +1775,14 @@ class MmuAcePatcher:
             self.ace.filament.pos = FILAMENT_POS_LOADED
             self.ace_controller._handle_status_update(force=True)
 
+            # --- Spoolman sync on load ---
+            gate_lookup = self.ace_controller._get_gate_by_index(gate)
+            if gate_lookup:
+                _, gate_obj = gate_lookup
+                if gate_obj.spool_id > 0:
+                    await self.ace_controller._spoolman_set_active_spool(gate_obj.spool_id)
+            # --------------------------------
+
             message = f"MMU_LOAD: Loading {length}mm from gate {gate} (index {local_index}) at {speed}mm/s completed, MMU status updated"
             logging.info(message)
             await self._send_gcode_response(message)
@@ -1791,6 +1904,11 @@ class MmuAcePatcher:
                 self.ace.loaded_gate = TOOL_GATE_UNKNOWN  # No gate loaded anymore
                 self.ace.filament.pos = FILAMENT_POS_UNLOADED
                 self.ace_controller._handle_status_update(force=True)
+
+                # --- Spoolman sync on unload ---
+                await self.ace_controller._spoolman_set_active_spool(None)
+                # --------------------------------
+
 
                 message = "MMU_UNLOAD: Unloading all filaments completed, MMU status reset"
                 logging.info(message)
