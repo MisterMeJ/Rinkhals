@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
@@ -29,15 +31,17 @@ jobs:
         TODAY=$(date +%Y%m%d)
         
         # Get all tags that match today's date
-        TAGS=$(git ls-remote --tags origin | grep -o "refs/tags/${TODAY}_[0-9]*$" | sed "s/refs\/tags\/${TODAY}_//" || echo "0")
-        
-        # Find the highest build number for today
         MAX_BUILD=0
-        for tag in $TAGS; do
-          if [ "$tag" -gt "$MAX_BUILD" ]; then
-            MAX_BUILD=$tag
+        while IFS= read -r tag; do
+          if [[ $tag =~ ^${TODAY}_([0-9]+)$ ]]; then
+            BUILD_NUM="${BASH_REMATCH[1]}"
+            # Remove leading zeros for comparison
+            BUILD_NUM=$((10#$BUILD_NUM))
+            if [ "$BUILD_NUM" -gt "$MAX_BUILD" ]; then
+              MAX_BUILD=$BUILD_NUM
+            fi
           fi
-        done
+        done < <(git tag -l "${TODAY}_*")
         
         # Increment for next build
         NEXT_BUILD=$((MAX_BUILD + 1))
