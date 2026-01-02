@@ -23,13 +23,16 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Set version
+      id: version
+      run: echo "VERSION=$(date +%d%m%Y)_${{ github.run_number }}" >> $GITHUB_OUTPUT
     - name: Build Docker image for KS1
       uses: docker/build-push-action@v6
       with:
         push: false
         context: .
         build-args: |
-          version=${{ github.sha }}
+          version=${{ steps.version.outputs.VERSION }}
           KOBRA_MODEL_CODE=ks1
         outputs: type=local,dest=./build/dist
         cache-from: ${{ inputs.use_cache && 'type=gha' || '' }}
@@ -42,6 +45,6 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: artifact/update.swu
-        tag_name: $(date +%d%m%Y)_${{ github.run_number }}
+        tag_name: ${{ steps.version.outputs.VERSION }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
