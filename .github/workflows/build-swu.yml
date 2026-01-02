@@ -10,6 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
     - name: Set up QEMU
@@ -22,11 +23,11 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build and export SWU
+    - name: Build Docker image for KS1
       uses: docker/build-push-action@v6
       with:
-        context: .
         push: false
+        context: .
         build-args: |
           version=${{ github.sha }}
           KOBRA_MODEL_CODE=ks1
@@ -36,7 +37,7 @@ jobs:
     - name: Prepare SWU file
       run: |
         mkdir -p artifact
-        cp build/dist/*-ks1.swu artifact/update.swu
+        cp build/dist/update-ks1.swu artifact/update.swu
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
