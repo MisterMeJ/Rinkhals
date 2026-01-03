@@ -1409,8 +1409,6 @@ class MmuAcePatcher:
         host = config.get("host", None)
         self.ace_controller = MmuAceController(self.server, host)
 
-        self.reinit()
-
         # --- Spoolman config ---
         spoolman_cfg = config.getsection("spoolman", None)
         if spoolman_cfg:
@@ -1507,83 +1505,85 @@ class MmuAcePatcher:
     async def _on_gcode_mmu_unknown(self, args: dict[str, str | None], delegate):
         pass
 
-async def _on_gcode_mmu_select(self, args: dict[str, str | None], delegate):
-    """Select gate or tool (Happy Hare compatible)"""
-    tool = self._get_gcode_arg_int("TOOL", args, default=-1)
-    gate = self._get_gcode_arg_int("GATE", args, default=-1)
-    bypass = self._get_gcode_arg_int("BYPASS", args, default=0)
+    async def _on_gcode_mmu_select(self, args: dict[str, str | None], delegate):
+        """Select gate or tool (Happy Hare compatible)"""
+        tool = self._get_gcode_arg_int("TOOL", args, default=-1)
+        gate = self._get_gcode_arg_int("GATE", args, default=-1)
+        bypass = self._get_gcode_arg_int("BYPASS", args, default=0)
 
-    if bypass == 1:
-        # ACE has no bypass - log warning
-        logging.warning("MMU_SELECT BYPASS=1 not supported on ACE hardware")
-        return
+        if bypass == 1:
+            # ACE has no bypass - log warning
+            logging.warning("MMU_SELECT BYPASS=1 not supported on ACE hardware")
+            return
 
-    # ------------------------------------------------------------
-    # Direct GATE selection
-    # ------------------------------------------------------------
-    if gate >= 0:
-        num_gates = sum(len(unit.gates) for unit in self.ace.units)
-        if gate < num_gates:
-            self.ace.gate = gate
+        # ------------------------------------------------------------
+        # Direct GATE selection
+        # ------------------------------------------------------------
+        if gate >= 0:
+            num_gates = sum(len(unit.gates) for unit in self.ace.units)
+            if gate < num_gates:
+                self.ace.gate = gate
 
-            # Find tool that maps to this gate (reverse TTG lookup)
-            self.ace.tool = -1
-            for tool_idx, gate_idx in enumerate(self.ace.ttg_map):
-                if gate_idx == gate:
-                    self.ace.tool = tool_idx
-                    break
+                # Find tool that maps to this gate (reverse TTG lookup)
+                self.ace.tool = -1
+                for tool_idx, gate_idx in enumerate(self.ace.ttg_map):
+                    if gate_idx == gate:
+                        self.ace.tool = tool_idx
+                        break
 
-            # Selection only → not loaded
-            self.ace.filament.pos = FILAMENT_POS_UNLOADED
+                # Selection only → not loaded
+                self.ace.filament.pos = FILAMENT_POS_UNLOADED
 
-            self.ace_controller._handle_status_update(throttle=True)
-            logging.info(
-                f"Selected gate {gate}, tool {self.ace.tool}, filament_pos set to UNLOADED"
-            )
+                self.ace_controller._handle_status_update(throttle=True)
+                logging.info(
+                    f"Selected gate {gate}, tool {self.ace.tool}, filament_pos set to UNLOADED"
+                )
 
-            # --- Spoolman PUSH sync (gate select) ---
-            if self.ace_controller.spoolman_support == "push":
-                gate_lookup = self.ace_controller._get_gate_by_index(gate)
-                if gate_lookup:
-                    _, gate_obj = gate_lookup
-                    spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
+                # --- Spoolman PUSH sync (gate select) ---
+                if self.ace_controller.spoolman_support == "push":
+                    gate_lookup = self.ace_controller._get_gate_by_index(gate)
+                    if gate_lookup:
+                        _, gate_obj = gate_lookup
+                        spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
 
-                    await self.ace_controller._spoolman_set_active_spool(spool_id)
-            # ---------------------------------------
+                        await self.ace_controller._spoolman_set_active_spool(spool_id)
+                # ---------------------------------------
 
-        else:
-            logging.error(f"Invalid gate {gate}, total gates: {num_gates}")
+            else:
+                logging.error(f"Invalid gate {gate}, total gates: {num_gates}")
 
-    # ------------------------------------------------------------
-    # TOOL selection (resolve to gate)
-    # ------------------------------------------------------------
-    elif tool >= 0:
-        if tool < len(self.ace.ttg_map):
-            gate = self.ace.ttg_map[tool]
-            self.ace.gate = gate
-            self.ace.tool = tool
+        # ------------------------------------------------------------
+        # TOOL selection (resolve to gate)
+        # ------------------------------------------------------------
+        elif tool >= 0:
+            if tool < len(self.ace.ttg_map):
+                gate = self.ace.ttg_map[tool]
+                self.ace.gate = gate
+                self.ace.tool = tool
 
-            self.ace.filament.pos = FILAMENT_POS_UNLOADED
+                self.ace.filament.pos = FILAMENT_POS_UNLOADED
 
-            self.ace_controller._handle_status_update(throttle=True)
-            logging.info(
-                f"Selected tool {tool} -> gate {gate}, filament_pos set to UNLOADED"
-            )
+                self.ace_controller._handle_status_update(throttle=True)
+                logging.info(
+                    f"Selected tool {tool} -> gate {gate}, filament_pos set to UNLOADED"
+                )
 
-            # --- Spoolman PUSH sync (tool select) ---
-            if self.ace_controller.spoolman_support == "push":
-                gate_lookup = self.ace_controller._get_gate_by_index(gate)
-                if gate_lookup:
-                    _, gate_obj = gate_lookup
-                    spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
+                # --- Spoolman PUSH sync (tool select) ---
+                if self.ace_controller.spoolman_support == "push":
+                    gate_lookup = self.ace_controller._get_gate_by_index(gate)
+                    if gate_lookup:
+                        _, gate_obj = gate_lookup
+                        spool_id = gate_obj.spool_id if gate_obj.spool_id > 0 else None
 
-                    await self.ace_controller._spoolman_set_active_spool(spool_id)
-            # ---------------------------------------
+                        await self.ace_controller._spoolman_set_active_spool(spool_id)
+                # ---------------------------------------
 
-        else:
-            logging.error(f"Invalid tool {tool}, total tools: {len(self.ace.ttg_map)}")
+            else:
+                logging.error(f"Invalid tool {tool}, total tools: {len(self.ace.ttg_map)}")
 
     async def _on_gcode_mmu_slicer_tool_map(self, args: dict[str, str | None], delegate):
+        ...
+
         """Set slicer tool mapping (Happy Hare compatible)"""
         # Check if this is just a control command (SKIP_AUTOMAP without TOOL)
         if "TOOL" not in args and "SKIP_AUTOMAP" in args:
