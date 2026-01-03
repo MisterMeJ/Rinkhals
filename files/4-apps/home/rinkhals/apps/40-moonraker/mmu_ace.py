@@ -641,6 +641,46 @@ class MmuAceController:
 
         await self._run_spoolman_task(task())
 
+    async def _spoolman_pull_filament_data(self, gate_index: int, spool_id: int):
+        """
+        Ruft Filament-Details von Spoolman ab und aktualisiert die Gatter-Informationen.
+        """
+        if self.spoolman_support != "pull" or self.spoolman is None:
+            return
+
+        async def task():
+            try:
+                # API-Abruf über Moonraker Spoolman Komponente
+                spool_data = await self.server.call_method("spoolman_get_spool", {"spool_id": spool_id})
+                if not spool_data or "filament" not in spool_data:
+                    return
+
+                res = self._get_gate_by_index(gate_index)
+                if res is None:
+                    return
+                _, gate = res
+
+                # Daten aus Spoolman-Struktur extrahieren
+                filament = spool_data["filament"]
+                gate.material = filament.get("material", "Unknown")
+                gate.vendor = filament.get("vendor", {}).get("name", "Unknown")
+                
+                # Farbe konvertieren (Hex von Spoolman zu RGBA für MMU)
+                color_hex = filament.get("color_hex", "").replace("#", "")
+                if len(color_hex) == 6:
+                    # hex_to_rgba muss im Scope verfügbar sein (ist es laut deinem file)
+                    gate.color = hex_to_rgba(color_hex + "FF")
+                
+                # Temperatur setzen
+                gate.temperature = filament.get("settings_extruder_temp", 210)
+                
+                logging.info(f"[Spoolman] Pull erfolgreich für Gatter {gate_index}: {gate.material}")
+                self._handle_status_update(throttle=True)
+                
+            except Exception as e:
+                logging.warning(f"[Spoolman] Pull fehlgeschlagen für Spool {spool_id}: {e}")
+
+        await self._run_spoolman_task(task())
 
     def _handle_status_update(self, force: bool = False, throttle: bool = False):
         """Send status update notification with debouncing or throttling.
@@ -1060,6 +1100,11 @@ class MmuAceController:
                     # - otherwise: NOT mapped (-1)
                     try:
                         gate.spool_id = int(sku_info["serial"]) if sku_info.get("serial") else -1
+                    # Trigger Pull-Modus für Spoolman Daten
+                        if gate.spool_id > 0 and self.spoolman_support == "pull":
+                            self.eventloop.create_task(
+                                self._spoolman_pull_filament_data(global_gate_index, gate.spool_id)
+                            )
                     except Exception:
                         gate.spool_id = -1
 
